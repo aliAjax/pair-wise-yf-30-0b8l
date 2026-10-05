@@ -48,10 +48,14 @@ def parse_time(value: str | None, default: datetime | None = None) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def report_deadline(received_at: datetime, serious: bool, fatal: bool) -> datetime:
+def report_duration(serious: bool, fatal: bool) -> timedelta:
     if serious:
-        return received_at + timedelta(days=7 if fatal else 15)
-    return received_at + timedelta(days=90)
+        return timedelta(days=7 if fatal else 15)
+    return timedelta(days=90)
+
+
+def report_deadline(received_at: datetime, serious: bool, fatal: bool) -> datetime:
+    return received_at + report_duration(serious, fatal)
 
 
 class Repository:
@@ -140,6 +144,22 @@ class Repository:
                 created_at TEXT NOT NULL,
                 UNIQUE(case_id, case_revision)
             );
+            CREATE TABLE IF NOT EXISTS supplement_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES cases(id),
+                report_id INTEGER NOT NULL REFERENCES reports(id),
+                country TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                requested_at TEXT NOT NULL,
+                paused_at TEXT NOT NULL,
+                remaining_seconds REAL NOT NULL,
+                fulfilled_at TEXT,
+                fulfilled_by TEXT,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_supplement_case_status ON supplement_requests(case_id, status);
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER,
@@ -241,6 +261,7 @@ class PharmacovigilanceService:
             "intakes": [dict(r) for r in conn.execute("SELECT id,source,dedupe_key,received_at,created_by,created_at FROM intakes WHERE case_id=? ORDER BY id", (case_id,))],
             "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
             "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
+            "supplements": [dict(r) for r in conn.execute("SELECT * FROM supplement_requests WHERE case_id=? ORDER BY id", (case_id,))],
             "reviews": [dict(r) for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY id", (case_id,))],
             "audit": [dict(r) for r in conn.execute("SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE case_id=? ORDER BY id", (case_id,))] if role in {"medical_reviewer", "global_admin"} else [],
         }
@@ -319,6 +340,7 @@ class PharmacovigilanceService:
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (case_id, expected, int(serious), int(fatal), causality, rationale, actor, iso()),
             )
+            self._recalculate_open_supplements(conn, case_id, serious, fatal, actor, role)
             Repository.audit(conn, case_id, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality})
             return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected}
 
@@ -357,6 +379,148 @@ class PharmacovigilanceService:
             Repository.audit(conn, row["case_id"], actor, role, "report_submitted", {"report_id": report_id, "country": row["country"], "late": bool(late)})
             return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()), "idempotent": False}
 
+    @staticmethod
+    def _compute_remaining(received_at: datetime, serious: bool, fatal: bool, paused_at: datetime) -> float:
+        """暂停期间严重性变化后，按新规则重算暂停时刻的剩余预算（秒）。
+
+        剩余预算 = 新规则下的绝对到期时刻(received_at + 新时限) - 暂停时刻。
+        暂停期间时钟冻结，暂停前已流逝的时间照常计入，因此重算只影响剩余部分。
+        结果可能为负：恢复时若新到期时刻已过，报告立即逾期。
+        """
+        new_due_abs = report_deadline(received_at, serious, fatal)
+        return (new_due_abs - paused_at).total_seconds()
+
+    def request_supplement(self, report_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"regional_lead", "global_admin"}:
+            raise ApiError(403, "supplement_forbidden", "只有区域负责人或全局管理员可以登记补件要求")
+        with self.repo.tx() as conn:
+            row = conn.execute(
+                "SELECT r.*, c.region AS region FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?",
+                (report_id,),
+            ).fetchone()
+            if not row:
+                raise ApiError(404, "report_not_found", "报告不存在")
+            if not self.can_access(dict(row), role, region):
+                raise ApiError(403, "region_forbidden", "不能为其他区域报告登记补件要求")
+            if row["status"] == "submitted":
+                raise ApiError(409, "report_submitted", "报告已提交，不能暂停时限")
+            if row["status"] == "paused":
+                raise ApiError(409, "supplement_already_open", "该报告已有待补件要求，时限已暂停")
+            now = parse_time(body.get("requested_at"), utcnow())
+            due = parse_time(row["due_at"])
+            remaining = (due - now).total_seconds()
+            cur = conn.execute(
+                """INSERT INTO supplement_requests(case_id,report_id,country,status,requested_at,paused_at,
+                   remaining_seconds,revision,created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (row["case_id"], report_id, row["country"], "open", iso(now), iso(now),
+                 remaining, 1, actor, iso()),
+            )
+            conn.execute("UPDATE reports SET status='paused' WHERE id=?", (report_id,))
+            Repository.audit(conn, row["case_id"], actor, role, "supplement_requested",
+                             {"report_id": report_id, "country": row["country"], "remaining_seconds": remaining})
+            return {
+                "supplement": dict(conn.execute("SELECT * FROM supplement_requests WHERE id=?", (cur.lastrowid,)).fetchone()),
+                "report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()),
+            }
+
+    def fulfill_supplement(self, supplement_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"regional_lead", "global_admin"}:
+            raise ApiError(403, "supplement_forbidden", "只有区域负责人或全局管理员可以提交补件资料")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int):
+            raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        with self.repo.tx() as conn:
+            supp = conn.execute(
+                "SELECT s.*, c.region AS region FROM supplement_requests s JOIN cases c ON c.id=s.case_id WHERE s.id=?",
+                (supplement_id,),
+            ).fetchone()
+            if not supp:
+                raise ApiError(404, "supplement_not_found", "补件要求不存在")
+            if not self.can_access(dict(supp), role, region):
+                raise ApiError(403, "region_forbidden", "不能提交其他区域的补件资料")
+            # 乐观锁优先：两人同时提交时，后到者携带旧版本，收到冲突提示（原计时保留）。
+            if supp["revision"] != expected:
+                raise ApiError(409, "revision_conflict", "补件要求已被其他人处理，请重新读取后再提交")
+            if supp["status"] != "open":
+                raise ApiError(409, "supplement_already_fulfilled", "补件资料已到齐，时限已恢复")
+            now = parse_time(body.get("fulfilled_at"), utcnow())
+            new_due = now + timedelta(seconds=float(supp["remaining_seconds"]))
+            cur = conn.execute(
+                "UPDATE supplement_requests SET status='fulfilled',fulfilled_at=?,fulfilled_by=?,revision=revision+1 WHERE id=? AND revision=?",
+                (iso(now), actor, supplement_id, expected),
+            )
+            if cur.rowcount == 0:
+                raise ApiError(409, "revision_conflict", "补件要求已被其他人处理，原计时保留，请重试")
+            conn.execute("UPDATE reports SET status='pending',due_at=? WHERE id=?", (iso(new_due), supp["report_id"]))
+            Repository.audit(conn, supp["case_id"], actor, role, "supplement_fulfilled",
+                             {"supplement_id": supplement_id, "report_id": supp["report_id"],
+                              "country": supp["country"], "new_due_at": iso(new_due)})
+            return {
+                "supplement": dict(conn.execute("SELECT * FROM supplement_requests WHERE id=?", (supplement_id,)).fetchone()),
+                "report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (supp["report_id"],)).fetchone()),
+            }
+
+    def recalculate_supplement(self, supplement_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"regional_lead", "global_admin"}:
+            raise ApiError(403, "supplement_forbidden", "只有区域负责人或全局管理员可以重算剩余天数")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int):
+            raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        with self.repo.tx() as conn:
+            supp = conn.execute(
+                """SELECT s.*, c.region AS region, c.serious AS serious, c.fatal AS fatal, c.received_at AS received_at
+                   FROM supplement_requests s JOIN cases c ON c.id=s.case_id WHERE s.id=?""",
+                (supplement_id,),
+            ).fetchone()
+            if not supp:
+                raise ApiError(404, "supplement_not_found", "补件要求不存在")
+            if not self.can_access(dict(supp), role, region):
+                raise ApiError(403, "region_forbidden", "不能重算其他区域的补件时限")
+            if supp["status"] != "open":
+                raise ApiError(409, "supplement_not_open", "补件要求已结束，时限正在走，无需重算")
+            if supp["revision"] != expected:
+                raise ApiError(409, "revision_conflict", "补件要求已被其他人处理，原计时保留，请重试")
+            new_remaining = self._compute_remaining(
+                parse_time(supp["received_at"]), bool(supp["serious"]), bool(supp["fatal"]), parse_time(supp["paused_at"])
+            )
+            cur = conn.execute(
+                "UPDATE supplement_requests SET remaining_seconds=?,revision=revision+1 WHERE id=? AND revision=?",
+                (new_remaining, supplement_id, expected),
+            )
+            if cur.rowcount == 0:
+                raise ApiError(409, "revision_conflict", "重算冲突，原计时保留，请重试")
+            Repository.audit(conn, supp["case_id"], actor, role, "supplement_recalculated",
+                             {"supplement_id": supplement_id, "report_id": supp["report_id"],
+                              "country": supp["country"], "remaining_seconds": new_remaining})
+            return {"supplement": dict(conn.execute("SELECT * FROM supplement_requests WHERE id=?", (supplement_id,)).fetchone())}
+
+    def _recalculate_open_supplements(self, conn: sqlite3.Connection, case_id: int, serious: bool, fatal: bool, actor: str, role: str) -> None:
+        """严重性变化后重算该案例所有暂停中补件的剩余天数；其他国家报告不受影响。
+
+        采用乐观锁条件更新：若重算与他人操作冲突（条件未命中），抛出 409 并回滚，
+        原计时保留，可稍后通过重算接口重试。
+        """
+        rows = conn.execute(
+            "SELECT s.* FROM supplement_requests s WHERE s.case_id=? AND s.status='open'",
+            (case_id,),
+        ).fetchall()
+        if not rows:
+            return
+        case = self._case(conn, case_id)
+        received = parse_time(case["received_at"])
+        for supp in rows:
+            new_remaining = self._compute_remaining(received, serious, fatal, parse_time(supp["paused_at"]))
+            cur = conn.execute(
+                "UPDATE supplement_requests SET remaining_seconds=?,revision=revision+1 WHERE id=? AND revision=?",
+                (new_remaining, supp["id"], supp["revision"]),
+            )
+            if cur.rowcount == 0:
+                raise ApiError(409, "supplement_recalculate_conflict", "补件剩余天数重算失败，原计时保留，请重试")
+            Repository.audit(conn, case_id, actor, role, "supplement_recalculated",
+                             {"supplement_id": supp["id"], "report_id": supp["report_id"],
+                              "country": supp["country"], "remaining_seconds": new_remaining})
+
     def merge_cases(self, source_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "global_admin":
             raise ApiError(403, "merge_forbidden", "只有全局管理员可以合并案例")
@@ -376,8 +540,18 @@ class PharmacovigilanceService:
             Repository.audit(conn, source_id, actor, role, "case_merged_into", {"target_case_id": target_id})
             return {"case": dict(self._case(conn, source_id)), "idempotent": False}
 
+    def list_reports(self, role: str, region: str) -> list[dict[str, Any]]:
+        sql = "SELECT r.*, c.region AS region FROM reports r JOIN cases c ON c.id=r.case_id WHERE c.status!='merged'"
+        args: list[Any] = []
+        if role not in {"medical_reviewer", "global_admin"}:
+            sql += " AND c.region=?"
+            args.append(region)
+        sql += " ORDER BY r.id DESC"
+        return [dict(r) for r in self.repo.conn.execute(sql, args)]
+
     def overdue(self, role: str, region: str) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM reports WHERE status!='submitted' AND due_at < ?"
+        # 已暂停（等待补件）的报告时限冻结，不算逾期；恢复后到期日回到过去才会再出现。
+        sql = "SELECT * FROM reports WHERE status!='submitted' AND status!='paused' AND due_at < ?"
         args: list[Any] = [iso()]
         if role not in {"medical_reviewer", "global_admin"}:
             sql += " AND case_id IN (SELECT id FROM cases WHERE region=?)"
@@ -396,7 +570,7 @@ class PharmacovigilanceService:
 
     def state(self, role: str, region: str) -> dict[str, Any]:
         cases = self.list_cases(role, region, {})
-        return {"cases": cases, "overdue": self.overdue(role, region), "server_time": iso()}
+        return {"cases": cases, "reports": self.list_reports(role, region), "overdue": self.overdue(role, region), "server_time": iso()}
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -461,6 +635,14 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.service.merge_cases(case_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "submit":
             return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
+        if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "supplement-requests":
+            return 201, self.service.request_supplement(int(parts[2]), actor, role, region, body)
+        if len(parts) == 4 and parts[:2] == ["api", "supplement-requests"] and parts[2].isdigit():
+            supplement_id = int(parts[2])
+            if parts[3] == "fulfill":
+                return 200, self.service.fulfill_supplement(supplement_id, actor, role, region, body)
+            if parts[3] == "recalculate":
+                return 200, self.service.recalculate_supplement(supplement_id, actor, role, region, body)
         raise ApiError(404, "not_found", "接口不存在")
 
     def _handle(self, method: str) -> None:

@@ -1,5 +1,19 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒案例台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}</style>
+<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #e5e7eb}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}.badge{padding:2px 10px;border-radius:999px;font-size:13px;color:#fff}.running{background:#174ea6}.paused{background:#b45309}.submitted{background:#047857}.overdue{background:#b91c1c}</style>
 <h1>药物警戒案例台</h1><p>标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。</p>
-<section><h2>快速查看</h2><input id="user" value="global-admin"><input id="role" value="global_admin"><button onclick="load()">刷新案例</button><pre id="out"></pre></section>
-<script>async function load(){let h={'X-User-Id':user.value,'X-Role':role.value};let r=await fetch('/api/state',{headers:h});out.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<section><h2>快速查看</h2><input id="user" value="global-admin"><input id="role" value="global_admin"><button onclick="load()">刷新</button>
+<h3>分国家报告（计时状态）</h3><table id="reports"><tr><th>ID</th><th>国家</th><th>到期</th><th>状态</th></tr></table>
+<h3>逾期清单（仅计时中）</h3><table id="overdue"><tr><th>ID</th><th>国家</th><th>到期</th><th>状态</th></tr></table>
+<pre id="out"></pre></section>
+<script>
+function badge(s){let map={pending:['计时中','running'],overdue:['已逾期','overdue'],paused:['已暂停','paused'],submitted:['已提交','submitted']};let [t,c]=map[s]||[s,'running'];return '<span class="badge '+c+'">'+t+'</span>'}
+async function load(){
+  let h={'X-User-Id':user.value,'X-Role':role.value};
+  let d=await (await fetch('/api/state',{headers:h})).json();
+  reports.innerHTML='<tr><th>ID</th><th>国家</th><th>到期</th><th>状态</th></tr>'+d.reports.map(r=>`<tr><td>${r.id}</td><td>${r.country}</td><td>${r.due_at}</td><td>${badge(r.status)}</td></tr>`).join('');
+  overdue.innerHTML='<tr><th>ID</th><th>国家</th><th>到期</th><th>状态</th></tr>'+d.overdue.map(r=>`<tr><td>${r.id}</td><td>${r.country}</td><td>${r.due_at}</td><td>${badge(r.status)}</td></tr>`).join('');
+  out.textContent=JSON.stringify(d,null,2);
+}
+load();
+</script>
+</html>
