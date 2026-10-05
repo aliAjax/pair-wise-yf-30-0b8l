@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,59 @@ class ApiError(Exception):
         self.status = status
         self.code = code
         self.message = message
+
+
+class SupplementRendezvous:
+    """进程内为同一补件要求的并发提交提供会合点。
+
+    提交线程在完成数据库登记后调用 ``settle``：它先标记「已就绪」，再在一个小的
+    静默窗口内收集几乎同时到达的同行（以线程到达计数为准，而非较慢的数据库登记），
+    直到窗口内到达的所有同行都已就绪才返回。随后每个线程串行裁决，此时彼此的登记
+    行均已提交可见，从而保证：只有登记最早者成功，其余同时提交者收到冲突。
+    单人提交只付出一次静默等待。
+    """
+
+    QUIET = 0.10
+
+    def __init__(self) -> None:
+        import time as _time
+        self._time = _time
+        self._cond = threading.Condition(threading.Lock())
+        self._arrivals: dict[int, int] = {}
+        self._ready: dict[int, int] = {}
+
+    @contextmanager
+    def settle(self, request_id: int):
+        with self._cond:
+            self._arrivals[request_id] = self._arrivals.get(request_id, 0) + 1
+        try:
+            yield  # 调用方在此完成数据库登记
+            with self._cond:
+                self._ready[request_id] = self._ready.get(request_id, 0) + 1
+                self._cond.notify_all()
+                deadline = self._time.monotonic() + self.QUIET
+                while True:
+                    now = self._time.monotonic()
+                    arrivals = self._arrivals.get(request_id, 0)
+                    ready = self._ready.get(request_id, 0)
+                    if now >= deadline and ready >= arrivals:
+                        break
+                    if ready < arrivals:
+                        self._cond.wait(self.QUIET)  # 等同行完成数据库登记
+                    else:
+                        # 都已就绪：静默观察，期间有新到达则继续等其就绪
+                        before = arrivals
+                        self._cond.wait(max(0.0, deadline - now))
+                        if self._arrivals.get(request_id, 0) != before:
+                            deadline = self._time.monotonic() + self.QUIET
+        finally:
+            with self._cond:
+                self._arrivals[request_id] = self._arrivals.get(request_id, 0) - 1
+                self._ready[request_id] = self._ready.get(request_id, 0) - 1
+                if self._arrivals[request_id] <= 0:
+                    del self._arrivals[request_id]
+                    self._ready.pop(request_id, None)
+                self._cond.notify_all()
 
 
 def utcnow() -> datetime:
@@ -54,24 +108,46 @@ def report_deadline(received_at: datetime, serious: bool, fatal: bool) -> dateti
     return received_at + timedelta(days=90)
 
 
+def recalculate_remaining_seconds(*, received_at: datetime, serious: bool, fatal: bool,
+                                  paused_at: datetime, remaining_seconds: int | None) -> int:
+    """Recompute the paused clock budget after a severity ruling changes.
+
+    Time already consumed before the pause counts against the new reporting window,
+    so the remaining budget is ``new_window_due - paused_at`` (may be negative when
+    the new window was already exhausted before the pause).
+    """
+    return int(round((report_deadline(received_at, serious, fatal) - paused_at).total_seconds()))
+
+
 class Repository:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn = self._connect()
         self.init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None, timeout=5)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
 
     @contextmanager
     def tx(self):
-        self.conn.execute("BEGIN IMMEDIATE")
+        # 每个事务使用独立连接：ThreadingHTTPServer 会并发调用，共享连接会让
+        # 一个线程的 BEGIN/COMMIT 破坏另一个线程的事务。独立连接配合
+        # BEGIN IMMEDIATE / 行锁在 WAL 下真正串行化写事务。
+        conn = self._connect()
         try:
-            yield self.conn
-            self.conn.execute("COMMIT")
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("COMMIT")
         except Exception:
-            self.conn.execute("ROLLBACK")
+            conn.execute("ROLLBACK")
             raise
+        finally:
+            conn.close()
 
     def init_schema(self) -> None:
         self.conn.executescript(
@@ -126,8 +202,42 @@ class Repository:
                 submitted_at TEXT,
                 submitted_by TEXT,
                 late INTEGER NOT NULL DEFAULT 0,
+                clock_status TEXT NOT NULL DEFAULT 'running',
+                paused_at TEXT,
+                paused_remaining_seconds INTEGER,
+                recalc_failed INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(case_id, country)
             );
+            CREATE TABLE IF NOT EXISTS supplement_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id INTEGER NOT NULL REFERENCES reports(id),
+                case_id INTEGER NOT NULL REFERENCES cases(id),
+                authority TEXT NOT NULL,
+                reference_no TEXT,
+                requested_at TEXT NOT NULL,
+                documents_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'awaiting',
+                submitted_at TEXT,
+                submitted_by TEXT,
+                registered_at TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                resumed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS supplement_submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL REFERENCES supplement_requests(id),
+                actor TEXT NOT NULL,
+                registered_at TEXT NOT NULL,
+                documents_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(request_id, actor)
+            );
+            CREATE TABLE IF NOT EXISTS supplement_locks (
+                request_id INTEGER PRIMARY KEY REFERENCES supplement_requests(id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_active_supplement
+                ON supplement_requests(report_id) WHERE status='awaiting';
             CREATE TABLE IF NOT EXISTS medical_reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER NOT NULL REFERENCES cases(id),
@@ -151,6 +261,19 @@ class Repository:
             );
             """
         )
+        self._migrate()
+
+    def _migrate(self) -> None:
+        existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(reports)")}
+        migrations = (
+            ("clock_status", "ALTER TABLE reports ADD COLUMN clock_status TEXT NOT NULL DEFAULT 'running'"),
+            ("paused_at", "ALTER TABLE reports ADD COLUMN paused_at TEXT"),
+            ("paused_remaining_seconds", "ALTER TABLE reports ADD COLUMN paused_remaining_seconds INTEGER"),
+            ("recalc_failed", "ALTER TABLE reports ADD COLUMN recalc_failed INTEGER NOT NULL DEFAULT 0"),
+        )
+        for column, statement in migrations:
+            if column not in existing:
+                self.conn.execute(statement)
 
     @staticmethod
     def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -165,8 +288,30 @@ class Repository:
 
 
 class PharmacovigilanceService:
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, clock_recalculator=recalculate_remaining_seconds):
         self.repo = Repository(db_path)
+        self.clock_recalculator = clock_recalculator
+        self.rendezvous = SupplementRendezvous()
+
+    @staticmethod
+    def report_view(row: sqlite3.Row | dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+        """Serialize a report row with clock state and remaining budget."""
+        data = dict(row)
+        current = now or utcnow()
+        if data.get("clock_status") == "paused" and data.get("paused_at"):
+            data["remaining_seconds"] = data.get("paused_remaining_seconds")
+            data["paused"] = True
+        else:
+            data["remaining_seconds"] = int(round((parse_time(data["due_at"]) - current).total_seconds()))
+            data["paused"] = False
+        data["recalc_failed"] = bool(data.get("recalc_failed"))
+        return data
+
+    def _active_supplement(self, conn: sqlite3.Connection, report_id: int) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM supplement_requests WHERE report_id=? AND status='awaiting' ORDER BY id DESC LIMIT 1",
+            (report_id,),
+        ).fetchone()
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -240,7 +385,7 @@ class PharmacovigilanceService:
             "case": dict(case),
             "intakes": [dict(r) for r in conn.execute("SELECT id,source,dedupe_key,received_at,created_by,created_at FROM intakes WHERE case_id=? ORDER BY id", (case_id,))],
             "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
-            "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
+            "reports": [self.report_view(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
             "reviews": [dict(r) for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY id", (case_id,))],
             "audit": [dict(r) for r in conn.execute("SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE case_id=? ORDER BY id", (case_id,))] if role in {"medical_reviewer", "global_admin"} else [],
         }
@@ -320,7 +465,43 @@ class PharmacovigilanceService:
                 (case_id, expected, int(serious), int(fatal), causality, rationale, actor, iso()),
             )
             Repository.audit(conn, case_id, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality})
+            # Severity ruling changes the reporting window; paused clocks of this
+            # case are recomputed. Other cases and running clocks stay untouched.
+            if bool(case["serious"]) != serious or bool(case["fatal"]) != fatal:
+                updated_case = self._case(conn, case_id)
+                paused_rows = conn.execute("SELECT * FROM reports WHERE case_id=? AND clock_status='paused'", (case_id,)).fetchall()
+                for paused in paused_rows:
+                    self._recalc_paused_clock(conn, dict(paused), updated_case, actor, role, trigger="medical_review")
             return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected}
+
+    def _recalc_paused_clock(self, conn: sqlite3.Connection, report: dict[str, Any], case_row: sqlite3.Row,
+                             actor: str, role: str, trigger: str) -> dict[str, Any]:
+        """Recompute a paused report's remaining budget; on failure keep the old budget."""
+        paused_at = parse_time(report["paused_at"])
+        try:
+            new_remaining = self.clock_recalculator(
+                received_at=parse_time(case_row["received_at"]),
+                serious=bool(case_row["serious"]),
+                fatal=bool(case_row["fatal"]),
+                paused_at=paused_at,
+                remaining_seconds=report.get("paused_remaining_seconds"),
+            )
+            if not isinstance(new_remaining, int):
+                raise ValueError("clock recalculator must return int seconds")
+        except Exception as exc:  # keep original timing and wait for retry
+            conn.execute("UPDATE reports SET recalc_failed=1 WHERE id=?", (report["id"],))
+            Repository.audit(conn, report["case_id"], actor, role, "clock_recalc_failed",
+                             {"report_id": report["id"], "country": report["country"], "trigger": trigger, "error": str(exc)})
+            return {"report_id": report["id"], "recalculated": False,
+                    "remaining_seconds": report.get("paused_remaining_seconds")}
+        conn.execute(
+            "UPDATE reports SET paused_remaining_seconds=?,recalc_failed=0 WHERE id=?",
+            (new_remaining, report["id"]),
+        )
+        Repository.audit(conn, report["case_id"], actor, role, "clock_recalculated",
+                         {"report_id": report["id"], "country": report["country"], "trigger": trigger,
+                          "remaining_seconds": new_remaining})
+        return {"report_id": report["id"], "recalculated": True, "remaining_seconds": new_remaining}
 
     def create_report(self, case_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"regional_lead", "global_admin"}:
@@ -357,6 +538,180 @@ class PharmacovigilanceService:
             Repository.audit(conn, row["case_id"], actor, role, "report_submitted", {"report_id": report_id, "country": row["country"], "late": bool(late)})
             return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()), "idempotent": False}
 
+    def request_supplement(self, report_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
+        """监管发来补件要求：暂停该国家报告的时限时钟，仅影响这一国。"""
+        if role not in {"regional_lead", "global_admin"}:
+            raise ApiError(403, "supplement_forbidden", "当前角色不能登记监管补件要求")
+        authority = str(body.get("authority", "")).strip()
+        if not authority:
+            raise ApiError(400, "authority_required", "authority 必填")
+        documents = body.get("documents", [])
+        if documents is None:
+            documents = []
+        if not isinstance(documents, list) or not all(str(item).strip() for item in documents):
+            raise ApiError(400, "invalid_documents", "documents 必须是非空字符串列表")
+        requested_at = parse_time(body.get("requested_at"), utcnow())
+        now = utcnow()
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT r.*,c.region FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?", (report_id,)).fetchone()
+            if not row:
+                raise ApiError(404, "report_not_found", "报告不存在")
+            if not self.can_access(dict(row), role, region):
+                raise ApiError(403, "region_forbidden", "无权操作其他区域报告")
+            if row["status"] == "submitted":
+                raise ApiError(409, "report_submitted", "报告已提交，不能再暂停")
+            active = self._active_supplement(conn, report_id)
+            if active is not None:
+                raise ApiError(409, "supplement_active", "该报告已有进行中的补件要求，时限已暂停")
+            remaining = int(round((parse_time(row["due_at"]) - requested_at).total_seconds()))
+            try:
+                cur = conn.execute(
+                    """INSERT INTO supplement_requests(report_id,case_id,authority,reference_no,requested_at,
+                       documents_json,status,created_by,created_at)
+                       VALUES(?,?,?,?,?,?, 'awaiting',?,?)""",
+                    (report_id, row["case_id"], authority, body.get("reference_no"), iso(requested_at),
+                     json.dumps(documents, ensure_ascii=False), actor, iso(now)),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ApiError(409, "supplement_active", "该报告已有进行中的补件要求，时限已暂停") from exc
+            conn.execute(
+                "UPDATE reports SET clock_status='paused',paused_at=?,paused_remaining_seconds=?,recalc_failed=0 WHERE id=?",
+                (iso(requested_at), remaining, report_id),
+            )
+            conn.execute("INSERT OR IGNORE INTO supplement_locks(request_id) VALUES(?)", (cur.lastrowid,))
+            Repository.audit(conn, row["case_id"], actor, role, "supplement_requested",
+                             {"report_id": report_id, "country": row["country"], "authority": authority,
+                              "reference_no": body.get("reference_no"), "remaining_seconds": remaining})
+            report = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+            return {"report": self.report_view(report), "supplement_request_id": cur.lastrowid,
+                    "remaining_seconds": remaining}
+
+    def submit_supplement(self, supplement_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
+        """登记补件资料；只认登记时间最早的一份，后到者收到冲突提示。
+
+        资料到齐（登记最早的一份被采用）时按暂停时的剩余天数恢复该国时限。
+        """
+        registered_at = parse_time(body.get("registered_at"), utcnow())
+        resumed_at = parse_time(body.get("resumed_at"), utcnow())
+        documents = body.get("documents", [])
+        if documents is None:
+            documents = []
+        if not isinstance(documents, list) or not all(str(item).strip() for item in documents):
+            raise ApiError(400, "invalid_documents", "documents 必须是非空字符串列表")
+        with self.rendezvous.settle(supplement_id):
+            # 阶段一：在独立事务里登记本次提交并立即提交，使登记时间对并发者可见
+            with self.repo.tx() as conn:
+                req0 = conn.execute(
+                    "SELECT s.id,s.case_id,c.region FROM supplement_requests s JOIN cases c ON c.id=s.case_id WHERE s.id=?",
+                    (supplement_id,),
+                ).fetchone()
+                if not req0:
+                    raise ApiError(404, "supplement_not_found", "补件要求不存在")
+                if not self.can_access(dict(req0), role, region) or role == "medical_reviewer":
+                    raise ApiError(403, "supplement_forbidden", "当前角色不能提交补件资料")
+                duplicate = conn.execute(
+                    "SELECT id FROM supplement_submissions WHERE request_id=? AND actor=?",
+                    (supplement_id, actor),
+                ).fetchone()
+                if duplicate is not None:
+                    existing = conn.execute("SELECT * FROM supplement_requests WHERE id=?", (supplement_id,)).fetchone()
+                    if existing["status"] == "submitted" and existing["submitted_by"] == actor:
+                        report0 = conn.execute("SELECT * FROM reports WHERE id=?", (existing["report_id"],)).fetchone()
+                        return {"idempotent": True, "report": self.report_view(report0),
+                                "supplement": dict(existing), "conflict": False}
+                    raise ApiError(409, "supplement_conflict", "请勿重复提交补件资料")
+                conn.execute(
+                    "INSERT INTO supplement_submissions(request_id,actor,registered_at,documents_json,created_at) VALUES(?,?,?,?,?)",
+                    (supplement_id, actor, iso(registered_at), json.dumps(documents, ensure_ascii=False), iso(utcnow())),
+                )
+            # settle 退出前等待同刻同行都完成登记，随后串行裁决
+        # 阶段二：对补件锁行取写锁串行裁决（仅最早登记者能认领并恢复时钟）
+        result = self._adjudicate_supplement(supplement_id, actor, role, registered_at, resumed_at, documents)
+        if result.get("conflict_message"):
+            raise ApiError(409, "supplement_conflict", result["conflict_message"])
+        return result
+
+    def _adjudicate_supplement(self, supplement_id: int, actor: str, role: str,
+                               registered_at: datetime, resumed_at: datetime,
+                               documents: list) -> dict[str, Any]:
+        # 冲突（含换人）也必须在事务提交后再通知调用方，否则会被回滚。
+        conflict_message: str | None = None
+        with self.repo.tx() as conn:
+            locked = conn.execute(
+                "UPDATE supplement_locks SET request_id=request_id WHERE request_id=? RETURNING request_id",
+                (supplement_id,),
+            ).fetchone()
+            if not locked:
+                raise ApiError(404, "supplement_not_found", "补件要求不存在")
+            req = conn.execute("SELECT * FROM supplement_requests WHERE id=?", (supplement_id,)).fetchone()
+            report = conn.execute("SELECT * FROM reports WHERE id=?", (req["report_id"],)).fetchone()
+            if report["status"] == "submitted":
+                raise ApiError(409, "report_submitted", "报告已提交")
+            remaining = report["paused_remaining_seconds"]
+            earliest = conn.execute(
+                "SELECT * FROM supplement_submissions WHERE request_id=? ORDER BY registered_at ASC,id ASC LIMIT 1",
+                (supplement_id,),
+            ).fetchone()
+            i_am_earliest = earliest["actor"] == actor
+            if not i_am_earliest:
+                # 登记更晚：资料不被采用，不改任何状态，仅审计后冲突返回
+                Repository.audit(conn, req["case_id"], actor, role, "supplement_conflicted",
+                                 {"report_id": report["id"], "supplement_request_id": supplement_id,
+                                  "winner": earliest["actor"], "registered_at": iso(registered_at)})
+                conflict_message = f"补件冲突：{earliest['actor']} 的资料登记时间更早，已被采用"
+            else:
+                # 本人登记最早：原子认领（仅 awaiting 时成功）
+                claimed = conn.execute(
+                    "UPDATE supplement_requests SET status='submitted',submitted_at=?,submitted_by=?,registered_at=?,documents_json=?,resumed_at=? WHERE id=? AND status='awaiting'",
+                    (iso(utcnow()), actor, earliest["registered_at"], earliest["documents_json"],
+                     iso(resumed_at), supplement_id),
+                )
+                if claimed.rowcount == 1:
+                    # 最早登记者首次完成裁决：资料到齐，恢复时钟，全局仅一次
+                    new_due = resumed_at + timedelta(seconds=remaining)
+                    conn.execute(
+                        "UPDATE reports SET due_at=?,clock_status='running',paused_at=NULL WHERE id=?",
+                        (iso(new_due), report["id"]),
+                    )
+                    Repository.audit(conn, req["case_id"], actor, role, "supplement_submitted",
+                                     {"report_id": report["id"], "supplement_request_id": supplement_id,
+                                      "country": report["country"], "registered_at": iso(registered_at),
+                                      "remaining_seconds": remaining, "new_due_at": iso(new_due)})
+                    fresh_report = conn.execute("SELECT * FROM reports WHERE id=?", (report["id"],)).fetchone()
+                    winner_req = conn.execute("SELECT * FROM supplement_requests WHERE id=?", (supplement_id,)).fetchone()
+                    return {"idempotent": False, "report": self.report_view(fresh_report),
+                            "supplement": dict(winner_req), "conflict": False,
+                            "remaining_seconds": remaining, "new_due_at": fresh_report["due_at"]}
+                # 本人最早但已被（先前窗口的）提交恢复：理论上不会，因为认领只允许最早者；
+                # 若出现则保留最早者资料并冲突返回，时钟不重走。
+                conn.execute(
+                    "UPDATE supplement_requests SET submitted_by=?,registered_at=?,documents_json=? WHERE id=?",
+                    (actor, earliest["registered_at"], earliest["documents_json"], supplement_id),
+                )
+                Repository.audit(conn, req["case_id"], actor, role, "supplement_winner_superseded",
+                                 {"report_id": report["id"], "supplement_request_id": supplement_id,
+                                  "registered_at": earliest["registered_at"], "remaining_seconds": remaining})
+                conflict_message = "补件冲突：补件已被先登记并恢复时限，请刷新后查看"
+        return {"conflict_message": conflict_message}
+
+    def recalculate_clock(self, report_id: int, actor: str, role: str, region: str) -> dict[str, Any]:
+        """对暂停中的报告重算剩余天数；失败时保留原计时，可再次重试。"""
+        if role not in {"regional_lead", "global_admin"}:
+            raise ApiError(403, "supplement_forbidden", "当前角色不能重算报告时限")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT r.*,c.region FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?", (report_id,)).fetchone()
+            if not row:
+                raise ApiError(404, "report_not_found", "报告不存在")
+            if not self.can_access(dict(row), role, region):
+                raise ApiError(403, "region_forbidden", "无权操作其他区域报告")
+            if row["clock_status"] != "paused":
+                raise ApiError(409, "clock_running", "报告未暂停，无需重算")
+            case = self._case(conn, row["case_id"])
+            result = self._recalc_paused_clock(conn, dict(row), case, actor, role, trigger="manual_retry")
+            report = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+            result["report"] = self.report_view(report)
+            return result
+
     def merge_cases(self, source_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "global_admin":
             raise ApiError(403, "merge_forbidden", "只有全局管理员可以合并案例")
@@ -377,12 +732,23 @@ class PharmacovigilanceService:
             return {"case": dict(self._case(conn, source_id)), "idempotent": False}
 
     def overdue(self, role: str, region: str) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM reports WHERE status!='submitted' AND due_at < ?"
+        # 暂停中的报告时钟不走，不计入逾期；逾期清单直接显示计时状态
+        sql = "SELECT * FROM reports WHERE status!='submitted' AND clock_status='running' AND due_at < ?"
         args: list[Any] = [iso()]
         if role not in {"medical_reviewer", "global_admin"}:
             sql += " AND case_id IN (SELECT id FROM cases WHERE region=?)"
             args.append(region)
-        return [dict(r) for r in self.repo.conn.execute(sql, args)]
+        return [self.report_view(r) for r in self.repo.conn.execute(sql, args)]
+
+    def paused(self, role: str, region: str) -> list[dict[str, Any]]:
+        """All paused (awaiting supplement) country clocks visible to the caller."""
+        sql = "SELECT * FROM reports WHERE clock_status='paused'"
+        args: list[Any] = []
+        if role not in {"medical_reviewer", "global_admin"}:
+            sql += " AND case_id IN (SELECT id FROM cases WHERE region=?)"
+            args.append(region)
+        sql += " ORDER BY paused_at,id"
+        return [self.report_view(r) for r in self.repo.conn.execute(sql, args)]
 
     def escalate_overdue(self, actor: str, role: str, region: str) -> dict[str, Any]:
         if role not in {"regional_lead", "global_admin"}:
@@ -390,13 +756,14 @@ class PharmacovigilanceService:
         rows = self.overdue(role, region)
         with self.repo.tx() as conn:
             for row in rows:
-                conn.execute("UPDATE reports SET status='overdue' WHERE id=? AND status='pending'", (row["id"],))
+                conn.execute("UPDATE reports SET status='overdue' WHERE id=? AND status='pending' AND clock_status='running'", (row["id"],))
                 Repository.audit(conn, row["case_id"], actor, role, "report_overdue_escalated", {"report_id": row["id"], "country": row["country"]})
         return {"escalated": len(rows)}
 
     def state(self, role: str, region: str) -> dict[str, Any]:
         cases = self.list_cases(role, region, {})
-        return {"cases": cases, "overdue": self.overdue(role, region), "server_time": iso()}
+        return {"cases": cases, "overdue": self.overdue(role, region),
+                "paused": self.paused(role, region), "server_time": iso()}
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -437,6 +804,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"cases": self.service.list_cases(role, region, query)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
+        if path == "/api/paused":
+            return 200, {"reports": self.service.paused(role, region)}
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
@@ -461,6 +830,12 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.service.merge_cases(case_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "submit":
             return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
+        if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "request-supplement":
+            return 201, self.service.request_supplement(int(parts[2]), actor, role, region, body)
+        if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "recalculate-clock":
+            return 200, self.service.recalculate_clock(int(parts[2]), actor, role, region)
+        if len(parts) == 4 and parts[:2] == ["api", "supplements"] and parts[2].isdigit() and parts[3] == "submissions":
+            return 201, self.service.submit_supplement(int(parts[2]), actor, role, region, body)
         raise ApiError(404, "not_found", "接口不存在")
 
     def _handle(self, method: str) -> None:

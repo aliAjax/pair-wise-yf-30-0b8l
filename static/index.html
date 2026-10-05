@@ -1,5 +1,96 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒案例台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}</style>
-<h1>药物警戒案例台</h1><p>标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。</p>
-<section><h2>快速查看</h2><input id="user" value="global-admin"><input id="role" value="global_admin"><button onclick="load()">刷新案例</button><pre id="out"></pre></section>
-<script>async function load(){let h={'X-User-Id':user.value,'X-Role':role.value};let r=await fetch('/api/state',{headers:h});out.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:32px auto;padding:0 20px;background:#f5f7fa;color:#172033}
+section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}
+input,textarea,button,select{font:inherit;padding:8px;margin:4px}
+input,textarea,select{width:auto}
+button{background:#174ea6;color:white;border:0;border-radius:6px;cursor:pointer}
+button.warn{background:#b25f00}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border-bottom:1px solid #e6eaf0;padding:7px 8px;text-align:left;vertical-align:top}
+th{color:#5b6577;font-weight:600}
+.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600}
+.running{background:#e6f4ea;color:#1e7d3a}
+.paused{background:#fdeecd;color:#9a5a00}
+.overdue{background:#fde7e9;color:#b3261e}
+.submitted{background:#e9edf5;color:#3a4456}
+.failed{background:#fde7e9;color:#b3261e;margin-left:6px}
+.muted{color:#8a93a5;font-size:12px}
+pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto;border-radius:8px}
+</style>
+<h1>药物警戒案例台</h1><p>标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。分国家报告显示「计时中 / 已暂停」状态与剩余天数。</p>
+<section>
+  <h2>快速查看</h2>
+  用户 <input id="user" value="global-admin">
+  角色 <input id="role" value="global_admin">
+  区域 <input id="region" value="">
+  <button onclick="load()">刷新状态</button>
+  <div id="summary"></div>
+  <h3>分国家报告（含暂停/计时）</h3>
+  <table id="reports"><thead><tr>
+    <th>报告ID</th><th>国家</th><th>时钟</th><th>剩余</th><th>到期时间</th><th>状态</th><th>操作</th>
+  </tr></thead><tbody></tbody></table>
+  <h3>逾期清单（暂停中的报告不计逾期）</h3>
+  <table id="overdue"><thead><tr><th>报告ID</th><th>国家</th><th>时钟</th><th>到期时间</th><th>状态</th></tr></thead><tbody></tbody></table>
+</section>
+<section>
+  <h3>补件操作</h3>
+  <div class="muted">暂停：登记监管补件要求，先冻结该国时限；补齐：按暂停时剩余天数续算。</div>
+  报告ID <input id="opReport" placeholder="例如 1" style="width:80px">
+  监管机构 <input id="opAuth" placeholder="NMPA" style="width:110px">
+  补件要求ID <input id="opReq" placeholder="补齐时填写" style="width:90px">
+  <button onclick="pause()">暂停该国时限</button>
+  <button class="warn" onclick="resume()">资料已到齐·恢复</button>
+  <button onclick="recalc()">重算暂停剩余</button>
+  <pre id="opOut" style="display:none"></pre>
+</section>
+<script>
+let headers=()=>{let h={'X-User-Id':user.value,'X-Role':role.value};if(region.value)h['X-Region']=region.value;return h};
+function fmtRemaining(sec){if(sec==null)return '—';let d=(sec/86400);let sign=d<0?'已超 ':'剩 ';return sign+Math.abs(d).toFixed(2)+' 天'+' ('+sec+' 秒)'}
+function clockBadge(r){
+  if(r.status==='submitted')return '<span class="badge submitted">已提交</span>';
+  if(r.clock_status==='paused')return '<span class="badge paused">⏸ 已暂停</span>'+(r.recalc_failed?'<span class="badge failed">重算失败·待重试</span>':'');
+  if(r.status==='overdue'||r.remaining_seconds<0)return '<span class="badge overdue">⏱ 已逾期</span>';
+  return '<span class="badge running">▶ 计时中</span>';
+}
+function row(r,actions){
+  return `<tr><td>${r.id}</td><td>${r.country}</td><td>${clockBadge(r)}</td>
+  <td>${r.clock_status==='paused'?'<b>'+fmtRemaining(r.remaining_seconds)+'</b>':fmtRemaining(r.remaining_seconds)}</td>
+  <td>${r.due_at}</td><td>${r.status}</td><td>${actions||''}</td></tr>`;
+}
+async function api(path,opts){let r=await fetch(path,Object.assign({headers:headers()},opts));let j=await r.json();if(!r.ok)throw {status:r.status,body:j};return j}
+async function load(){
+  try{
+    let s=await api('/api/state');
+    summary.textContent=`案例 ${s.cases.length} 个 · 计时/逾期报告 ${s.overdue.length} 份 · 暂停报告 ${s.paused.length} 份 · 服务器时间 ${s.server_time}`;
+    // 汇总所有案例的报告需要逐案例拉取；这里用 state 中的逾期 + paused，以及通过 /api/cases 已有的信息
+    let tbody=document.querySelector('#reports tbody');tbody.innerHTML='';
+    for(const c of s.cases){
+      let detail=await api('/api/cases/'+c.id);
+      for(const r of detail.reports){
+        let acts=r.clock_status==='paused'
+          ? `<button onclick="quick(${r.id})">暂停中</button>`
+          : `<button onclick="quick(${r.id})">登记补件</button>`;
+        tbody.insertAdjacentHTML('beforeend',row(r,acts));
+      }
+    }
+    document.querySelector('#overdue tbody').innerHTML=
+      s.overdue.map(r=>row(r,'')).join('')||'<tr><td colspan=5 class=muted>暂无逾期（暂停中的报告时钟不走）</td></tr>';
+  }catch(e){summary.textContent='加载失败：'+JSON.stringify(e.body||e);}
+}
+function quick(id){opReport.value=id}
+async function pause(){
+  try{let j=await api('/api/reports/'+opReport.value+'/request-supplement',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},headers()),body:JSON.stringify({authority:opAuth.value||'NMPA'})});
+    opReq.value=j.supplement_request_id;showOut(j);load();}catch(e){showOut(e.body)}
+}
+async function resume(){
+  try{let j=await api('/api/supplements/'+opReq.value+'/submissions',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},headers()),body:JSON.stringify({documents:['补充资料.pdf']})});
+    showOut(j);load();}catch(e){showOut(e.body||e)}
+}
+async function recalc(){
+  try{let j=await api('/api/reports/'+opReport.value+'/recalculate-clock',{method:'POST',headers:headers()});showOut(j);load();}
+  catch(e){showOut(e.body||e)}
+}
+function showOut(j){opOut.style.display='block';opOut.textContent=JSON.stringify(j,null,2)}
+load();
+</script>
